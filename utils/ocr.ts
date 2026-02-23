@@ -134,8 +134,9 @@ function parseCardInfo(text: string): {
   language: string | null;
   hp: string | null;
 } {
+  // Splitta per newline E per pipe (OCR.space separa i blocchi con "|")
   const lines = text
-    .split('\n')
+    .split(/[\n|]/)
     .map((l) => l.trim())
     .filter(Boolean);
 
@@ -168,24 +169,44 @@ function parseCardInfo(text: string): {
     }
   }
 
-  // 1b. Pattern fuzzy: OCR a volte garble "001/165" come "0017165" o "001 165"
-  //     Cerca sequenze di 6-7 cifre nelle ultime righe (zona codice)
+  // 1b. Pattern fuzzy: OCR a volte garble "001/165" come "001 165"
   if (!cardNumber) {
     const lastThird = text.substring(Math.floor(text.length * 0.5));
     const fuzzyMatches = lastThird.matchAll(/(\d{3,4})[\s.,;:]*(\d{2,3})\b/g);
     for (const m of fuzzyMatches) {
-      const part1 = m[1];
-      const part2 = m[2];
-      // Prova a interpretare: "0017165" → "001" + "7165" no...
-      // "001 165" → "001" + "165" sì!
-      // Consideriamo part1 come card number e part2 come set total
-      const numVal = parseInt(part1, 10);
-      const totVal = parseInt(part2, 10);
+      const numVal = parseInt(m[1], 10);
+      const totVal = parseInt(m[2], 10);
       if (numVal >= 1 && numVal <= 300 && totVal >= 30 && totVal <= 400) {
         cardNumber = String(numVal).padStart(3, '0');
         setTotal = String(totVal);
         cardNumberIndex = (m.index ?? 0) + Math.floor(text.length * 0.5);
-        console.log('[OCR] Codice carta trovato (fuzzy):', cardNumber + '/' + setTotal);
+        console.log('[OCR] Codice carta trovato (fuzzy sep):', cardNumber + '/' + setTotal);
+        break;
+      }
+    }
+  }
+
+  // 1c. Pattern per cifre attaccate: "1957165" → spezza a posizione 3 → "195/165"
+  //     Quando la "/" diventa una cifra (es. "7"), otteniamo 6-7 cifre consecutive
+  if (!cardNumber) {
+    const lastThird = text.substring(Math.floor(text.length * 0.5));
+    const longDigits = lastThird.matchAll(/(\d{6,7})/g);
+    for (const m of longDigits) {
+      const digits = m[1];
+      // Prova a spezzare a posizione 3: "1957165" → "195" + "7165" → scarta "7" → "165"
+      const firstThree = parseInt(digits.substring(0, 3), 10);
+      const restStr = digits.substring(3);
+      // Se il resto inizia con una cifra extra (la "/" garbled), prova a toglierla
+      let rest = parseInt(restStr, 10);
+      // "7165" → 7165, troppo grande. Prova togliendo il primo char: "165" → 165
+      if (rest > 400 && restStr.length >= 4) {
+        rest = parseInt(restStr.substring(1), 10);
+      }
+      if (firstThree >= 1 && firstThree <= 400 && rest >= 30 && rest <= 400) {
+        cardNumber = String(firstThree).padStart(3, '0');
+        setTotal = String(rest);
+        cardNumberIndex = (m.index ?? 0) + Math.floor(text.length * 0.5);
+        console.log('[OCR] Codice carta trovato (cifre attaccate):', cardNumber + '/' + setTotal);
         break;
       }
     }
@@ -284,14 +305,23 @@ function parseCardInfo(text: string): {
   // 4. NOME (prima riga significativa in alto)
   // ══════════════════════════════════════════════════
   const SKIP_WORDS = new Set([
+    // Inglese
     'basic', 'base', 'stage', 'trainer', 'supporter',
     'item', 'energy', 'stadium', 'tool', 'pokemon',
     'the', 'and', 'for', 'you', 'your', 'this',
     'weakness', 'resistance', 'retreat', 'rule',
+    // Italiano — tipi di carta
+    'aiuto', 'aluto', 'ainto',       // "Aiuto" (Supporter) + OCR garbled
+    'strumento', 'stadio', 'energia', // Tool, Stadium, Energy
+    'allenatore',                     // Trainer
+    'oggetto',                        // Item
     'debolezza', 'resistenza', 'ritirata', 'regola',
+    'ill',                            // "Ill." (illustratore) garbled
   ]);
 
-  for (const line of lines.slice(0, 6)) {
+  // Con il pipe-split, i segmenti sono più piccoli e più numerosi
+  // Scansioniamo i primi 10 segmenti per trovare il nome
+  for (const line of lines.slice(0, 10)) {
     const cleaned = line
       .replace(/^(BASIC|BAS[1I]C|BASE|Stage\s*\d|STAGE\s*\d)\s*/i, '')
       .replace(/\s*\d{2,3}\s*HP.*$/i, '')
@@ -301,6 +331,7 @@ function parseCardInfo(text: string): {
 
     if (
       cleaned.length >= 3 &&
+      cleaned.length <= 40 &&          // Nomi carte sono brevi (max ~30 car.)
       !/^\d+$/.test(cleaned) &&
       !SKIP_WORDS.has(cleaned.toLowerCase())
     ) {
