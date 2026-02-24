@@ -88,6 +88,78 @@ interface TcgDexDetail {
   };
 }
 
+const QUERY_SET_CODES = new Set([
+  'SVI', 'PAL', 'OBF', 'MEW', 'PAR', 'TEF', 'TWM', 'SFA', 'SCR',
+  'SSP', 'PRE', 'JTG', 'SSH', 'RCL', 'DAA', 'VIV', 'BST', 'CRE',
+  'EVS', 'FST', 'BRS', 'ASR', 'LOR', 'SIT', 'CRZ', 'SUM', 'GRI',
+  'BUS', 'SHL', 'CIN', 'UPR', 'FLI', 'CES', 'LOT', 'TEU', 'UNB',
+  'UNM', 'CEC', 'XY', 'PHF', 'PRC', 'ROS', 'AOR', 'BKT', 'BKP',
+  'FCO', 'STS', 'EVO', 'SVP', 'SMP',
+]);
+
+const QUERY_LANGUAGES = new Set([
+  'it', 'en', 'fr', 'de', 'es', 'pt', 'ja', 'ko', 'zh',
+]);
+
+const QUERY_REG_MARKS = new Set(['D', 'E', 'F', 'G', 'H', 'I']);
+
+function parseSearchQuery(raw: string): {
+  name: string;
+  cardNumber: string | null;
+  setTotal: string | null;
+  setCode: string | null;
+  language: string | null;
+  regulationMark: string | null;
+} {
+  const rawTrimmed = raw.trim();
+  const cardCodeMatch = rawTrimmed.match(/(\d{1,3})\s*\/\s*(\d{2,3})/);
+  const cardNumber = cardCodeMatch ? cardCodeMatch[1] : null;
+  const setTotal = cardCodeMatch ? cardCodeMatch[2] : null;
+  const nameWithoutCode = cardCodeMatch
+    ? rawTrimmed.replace(cardCodeMatch[0], ' ')
+    : rawTrimmed;
+
+  const tokens = nameWithoutCode
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  let setCode: string | null = null;
+  let language: string | null = null;
+  let regulationMark: string | null = null;
+
+  const kept: string[] = [];
+  for (const token of tokens) {
+    const upper = token.toUpperCase();
+    const lower = token.toLowerCase();
+
+    if (!setCode && QUERY_SET_CODES.has(upper)) {
+      setCode = upper;
+      continue;
+    }
+    if (!language && QUERY_LANGUAGES.has(lower)) {
+      language = lower;
+      continue;
+    }
+    if (!regulationMark && QUERY_REG_MARKS.has(upper)) {
+      regulationMark = upper;
+      continue;
+    }
+
+    kept.push(token);
+  }
+
+  const normalizedName = kept.join(' ').trim();
+  return {
+    name: normalizedName.length > 0 ? normalizedName : rawTrimmed,
+    cardNumber,
+    setTotal,
+    setCode,
+    language,
+    regulationMark,
+  };
+}
+
 // ── Traduzione IT → EN (MyMemory API, gratuita, no key) ─────────
 
 async function translateToEnglish(text: string): Promise<string | null> {
@@ -219,6 +291,78 @@ function normalizeId(id: string): string {
   return id.replace(/^0+/, '') || '0';
 }
 
+/**
+ * Ricerca shortlist candidati per selezione manuale.
+ * Usa i metadata in query (numero/set/reg) per evitare falsi positivi.
+ */
+export async function searchCardCandidates(
+  rawQuery: string,
+  limit = 5
+): Promise<ScanResult[]> {
+  const parsed = parseSearchQuery(rawQuery);
+  const clean = parsed.name.trim();
+  if (clean.length < 2) return [];
+
+  try {
+    const { items: results, lang } = await tcgdexSearch(clean);
+    if (results.length === 0) return [];
+
+    let candidates = results;
+    if (parsed.cardNumber) {
+      const targetNum = normalizeId(parsed.cardNumber);
+      const byNum = candidates.filter(
+        (c) => normalizeId(c.localId ?? '') === targetNum
+      );
+      if (byNum.length > 0) candidates = byNum;
+    }
+
+    const strictSet = parsed.setCode?.toUpperCase() ?? null;
+    const strictReg = parsed.regulationMark?.toUpperCase() ?? null;
+    const targetTotal = parsed.setTotal ? parseInt(parsed.setTotal, 10) : null;
+
+    const toCheck = candidates.slice(0, 20);
+    const details: TcgDexDetail[] = [];
+    for (const c of toCheck) {
+      const d = await tcgdexDetail(c.id, lang);
+      if (!d) continue;
+
+      const setId = (d.set?.id ?? '').toUpperCase();
+      const setName = (d.set?.name ?? '').toUpperCase();
+      const reg = (d.regulationMark ?? '').toUpperCase();
+      const total =
+        d.set?.cardCount?.official ??
+        d.set?.cardCount?.total;
+
+      const setOk = !strictSet || setId.includes(strictSet) || setName.includes(strictSet);
+      const regOk = !strictReg || reg === strictReg;
+      const totalOk = targetTotal === null || (total ? Math.abs(total - targetTotal) <= 5 : false);
+
+      if (setOk && regOk && totalOk) {
+        details.push(d);
+      }
+    }
+
+    // Se i filtri sono troppo stretti, fallback ai candidati già ridotti.
+    const source = details.length > 0 ? details : [];
+    if (source.length > 0) {
+      return source
+        .slice(0, limit)
+        .map((d) => detailToResult(d, 0.9, parsed.setTotal));
+    }
+
+    // Ultimo fallback: prova comunque a mostrare qualche opzione per scelta manuale.
+    const fallbackDetails: TcgDexDetail[] = [];
+    for (const c of candidates.slice(0, limit)) {
+      const d = await tcgdexDetail(c.id, lang);
+      if (d) fallbackDetails.push(d);
+    }
+    return fallbackDetails.map((d) => detailToResult(d, 0.75, parsed.setTotal));
+  } catch (error) {
+    console.warn('[API] searchCardCandidates fallita:', error);
+    return [];
+  }
+}
+
 // ── Ricerca intelligente ────────────────────────────────────────
 
 /**
@@ -236,7 +380,37 @@ export async function searchCardByName(
   hp?: string | null,
   setCode?: string | null
 ): Promise<ScanResult | null> {
-  const clean = name.trim();
+  const parsedQuery = parseSearchQuery(name);
+  const clean = parsedQuery.name.trim();
+  const effectiveCardNumber = cardNumber ?? parsedQuery.cardNumber;
+  const effectiveSetTotal = setTotal ?? parsedQuery.setTotal;
+  const effectiveSetCode = setCode ?? parsedQuery.setCode;
+  const effectiveLanguage = parsedQuery.language;
+  const effectiveRegMark = parsedQuery.regulationMark;
+  const strictQueryMetadata = Boolean(parsedQuery.setCode || parsedQuery.regulationMark);
+
+  if (
+    parsedQuery.name !== name.trim() ||
+    parsedQuery.setCode ||
+    parsedQuery.language ||
+    parsedQuery.regulationMark
+  ) {
+    console.log(
+      '[API] Query normalizzata:',
+      clean,
+      '| code:',
+      effectiveCardNumber && effectiveSetTotal
+        ? `${effectiveCardNumber}/${effectiveSetTotal}`
+        : '-',
+      '| set:',
+      effectiveSetCode ?? '-',
+      '| lang:',
+      effectiveLanguage ?? '-',
+      '| reg:',
+      effectiveRegMark ?? '-'
+    );
+  }
+
   if (clean.length < 2) return null;
 
   try {
@@ -246,20 +420,20 @@ export async function searchCardByName(
 
     // ── Filtra per numero carta ──────────────────
     let candidates = results;
-    if (cardNumber) {
-      const targetNum = normalizeId(cardNumber);
+    if (effectiveCardNumber) {
+      const targetNum = normalizeId(effectiveCardNumber);
       const filtered = results.filter(
         (c) => normalizeId(c.localId ?? '') === targetNum
       );
       if (filtered.length > 0) {
         candidates = filtered;
-        console.log('[API] Filtrati per #' + cardNumber + ':', candidates.length);
+        console.log('[API] Filtrati per #' + effectiveCardNumber + ':', candidates.length);
       }
     }
 
     // ── Filtra per set code (es. "MEW", "SVI") ──────
-    if (setCode && candidates.length > 1) {
-      const upperCode = setCode.toUpperCase();
+    if (effectiveSetCode && candidates.length > 1) {
+      const upperCode = effectiveSetCode.toUpperCase();
       console.log('[API] Filtro per set code:', upperCode);
 
       // L'ID TCGdex contiene spesso il codice set (es. "sv03.5-001" per 151/MEW)
@@ -283,7 +457,7 @@ export async function searchCardByName(
 
       if (setMatches.length === 1) {
         console.log('[API] MATCH UNICO per set code!', setMatches[0].item.id);
-        return detailToResult(setMatches[0].detail, 0.98, setTotal);
+        return detailToResult(setMatches[0].detail, 0.98, effectiveSetTotal);
       }
       if (setMatches.length > 0) {
         // Restringe i candidati a quelli con set code giusto
@@ -292,9 +466,73 @@ export async function searchCardByName(
       }
     }
 
+    // ── Filtra per regulation mark (es. "G") ──────
+    if (effectiveRegMark && candidates.length > 1) {
+      const targetReg = effectiveRegMark.toUpperCase();
+      const toCheck = candidates.slice(0, 10);
+      const regMatches: { item: TcgDexItem; detail: TcgDexDetail }[] = [];
+
+      console.log('[API] Filtro per regulation mark:', targetReg);
+      for (const c of toCheck) {
+        const detail = await tcgdexDetail(c.id, lang);
+        if (!detail) continue;
+        const reg = (detail.regulationMark ?? '').toUpperCase();
+        if (reg === targetReg) {
+          regMatches.push({ item: c, detail });
+          console.log('[API]   Reg mark match:', c.id, '→', reg);
+        }
+      }
+
+      if (regMatches.length === 1) {
+        console.log('[API] MATCH UNICO per regulation mark!', regMatches[0].item.id);
+        return detailToResult(regMatches[0].detail, 0.98, effectiveSetTotal);
+      }
+      if (regMatches.length > 0) {
+        candidates = regMatches.map((m) => m.item);
+        console.log('[API] Candidati ridotti a', candidates.length, 'per regulation mark');
+      }
+    }
+
+    // ── Modalità rigida (solo query manuale con metadata) ─────────
+    // Se l'utente specifica set/reg nella query, non accettare fallback incoerenti.
+    if (strictQueryMetadata) {
+      const strictSet = effectiveSetCode?.toUpperCase() ?? null;
+      const strictReg = effectiveRegMark?.toUpperCase() ?? null;
+      const toCheck = candidates.slice(0, 12);
+      const strictMatches: { item: TcgDexItem; detail: TcgDexDetail }[] = [];
+
+      console.log('[API] Modalità rigida attiva (query metadata)');
+      for (const c of toCheck) {
+        const detail = await tcgdexDetail(c.id, lang);
+        if (!detail) continue;
+
+        const setId = (detail.set?.id ?? '').toUpperCase();
+        const setName = (detail.set?.name ?? '').toUpperCase();
+        const reg = (detail.regulationMark ?? '').toUpperCase();
+
+        const setOk = !strictSet || setId.includes(strictSet) || setName.includes(strictSet);
+        const regOk = !strictReg || reg === strictReg;
+        if (setOk && regOk) {
+          strictMatches.push({ item: c, detail });
+        }
+      }
+
+      if (strictMatches.length === 0) {
+        console.log('[API] Modalità rigida: nessun match coerente, stop');
+        return null;
+      }
+      if (strictMatches.length === 1) {
+        console.log('[API] Modalità rigida: match unico coerente!', strictMatches[0].item.id);
+        return detailToResult(strictMatches[0].detail, 0.99, effectiveSetTotal);
+      }
+
+      candidates = strictMatches.map((m) => m.item);
+      console.log('[API] Modalità rigida: candidati coerenti rimasti:', candidates.length);
+    }
+
     // ── Se abbiamo il totale set, matcha per quello ──
-    if (setTotal && candidates.length > 1) {
-      const targetTotal = parseInt(setTotal, 10);
+    if (effectiveSetTotal && candidates.length > 1) {
+      const targetTotal = parseInt(effectiveSetTotal, 10);
       console.log('[API] Cerco set con totale', targetTotal, 'tra', candidates.length, 'candidati...');
 
       const toCheck = candidates.slice(0, 10);
@@ -310,13 +548,13 @@ export async function searchCardByName(
 
         if (total && Math.abs(total - targetTotal) <= 5) {
           console.log('[API] MATCH ESATTO per set total! Set:', detail.set?.name);
-          return detailToResult(detail, 0.99, setTotal);
+          return detailToResult(detail, 0.99, effectiveSetTotal);
         }
       }
     }
 
     // ── Fallback HP: se non abbiamo codice carta, filtra per HP ──
-    if (!cardNumber && hp && candidates.length > 1) {
+    if (!effectiveCardNumber && hp && candidates.length > 1) {
       const targetHp = parseInt(hp, 10);
       console.log('[API] Filtro per HP', targetHp, 'tra', candidates.length, 'candidati...');
 
@@ -335,16 +573,17 @@ export async function searchCardByName(
 
       if (hpMatches.length === 1) {
         console.log('[API] MATCH UNICO per HP!', hpMatches[0].id);
-        return detailToResult(hpMatches[0].detail, 0.92, setTotal);
+        return detailToResult(hpMatches[0].detail, 0.92, effectiveSetTotal);
       }
       if (hpMatches.length > 1) {
         const best = hpMatches[hpMatches.length - 1];
         console.log('[API] Match HP multipli, prendo ultimo:', best.id);
-        return detailToResult(best.detail, 0.80, setTotal);
+        return detailToResult(best.detail, 0.80, effectiveSetTotal);
       }
     }
 
     // ── Fallback finale: primo risultato ──────────
+    // In modalità rigida arrivano qui solo candidati già coerenti.
     const exact = candidates.find(
       (c) => c.name.toLowerCase() === clean.toLowerCase()
     );
@@ -354,8 +593,8 @@ export async function searchCardByName(
     const detail = await tcgdexDetail(best.id, lang);
     if (!detail) return null;
 
-    const conf = cardNumber ? 0.85 : exact ? 0.80 : 0.70;
-    return detailToResult(detail, conf, setTotal);
+    const conf = effectiveCardNumber ? 0.85 : exact ? 0.80 : 0.70;
+    return detailToResult(detail, conf, effectiveSetTotal);
   } catch (error) {
     console.warn('[API] Ricerca fallita:', error);
     return null;

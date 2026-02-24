@@ -22,6 +22,7 @@ import { ConfidenceBar } from '@/components/confidence-bar';
 import { calculateCardCrop, CARD_ASPECT_RATIO } from '@/utils/crop';
 import {
   autoRecognizeCard,
+  searchCardCandidates,
   searchCardByName,
   type ScanResult,
 } from '@/utils/api';
@@ -38,6 +39,7 @@ type Phase =
   | 'scanning'
   | 'recognizing'
   | 'preview'
+  | 'candidates'
   | 'searching'
   | 'result';
 
@@ -48,8 +50,12 @@ export default function ScannerScreen() {
   const [phase, setPhase] = useState<Phase>('idle');
   const [croppedUri, setCroppedUri] = useState<string | null>(null);
   const [cardName, setCardName] = useState('');
+  const [manualCardCode, setManualCardCode] = useState('');
+  const [manualSetCode, setManualSetCode] = useState('');
+  const [manualRegMark, setManualRegMark] = useState('');
   const [statusMsg, setStatusMsg] = useState('');
   const [result, setResult] = useState<ScanResult | null>(null);
+  const [candidateResults, setCandidateResults] = useState<ScanResult[]>([]);
 
   const busyRef = useRef(false);
 
@@ -61,17 +67,18 @@ export default function ScannerScreen() {
     setPhase('scanning');
 
     try {
-      const photo = await cameraRef.current.takePictureAsync({ quality: 0.5 });
+      // Qualità più alta per migliorare OCR su numero/set/reg mark
+      const photo = await cameraRef.current.takePictureAsync({ quality: 0.8 });
       if (!photo) throw new Error('Foto nulla');
 
       setStatusMsg('Elaborazione immagine...');
 
-      // 1) Ridimensiona a 1024px (alta ris. per leggere codice in basso)
+      // 1) Ridimensiona a 1440px (più dettaglio per OCR del bordo basso)
       //    CON base64 → questa immagine INTERA va all'OCR
       const resized = await manipulateAsync(
         photo.uri,
-        [{ resize: { width: 1024 } }],
-        { format: SaveFormat.JPEG, compress: 0.8, base64: true }
+        [{ resize: { width: 1440 } }],
+        { format: SaveFormat.JPEG, compress: 0.9, base64: true }
       );
 
       // 2) Crop carta (solo per la preview visiva)
@@ -114,33 +121,75 @@ export default function ScannerScreen() {
 
   const handleSearch = useCallback(async () => {
     const name = cardName.trim();
+    const cardCode = manualCardCode.trim();
+    const setCode = manualSetCode.trim().toUpperCase();
+    const regMark = manualRegMark.trim().toUpperCase();
+
     if (name.length < 2) {
       Alert.alert('Nome troppo corto', 'Scrivi almeno 2 caratteri.');
       return;
     }
+    if (!/^\d{1,3}\s*\/\s*\d{2,3}$/.test(cardCode)) {
+      Alert.alert(
+        'Numero carta non valido',
+        'Inserisci il numero nel formato NNN/NNN (es. 205/165).'
+      );
+      return;
+    }
+    if (!/^[A-Z0-9]{2,4}$/.test(setCode)) {
+      Alert.alert(
+        'Set code non valido',
+        'Inserisci il codice set (2-4 caratteri), es. MEW, OBF, PAL.'
+      );
+      return;
+    }
+    if (regMark && !/^[DEFGHI]$/.test(regMark)) {
+      Alert.alert(
+        'Reg. Mark non valido',
+        'Se inserito, usa una sola lettera tra D, E, F, G, H, I.'
+      );
+      return;
+    }
 
     setPhase('searching');
-    const found = await searchCardByName(name);
+    const query = regMark
+      ? `${name} ${cardCode} ${setCode} ${regMark}`
+      : `${name} ${cardCode} ${setCode}`;
+    const candidates = await searchCardCandidates(query, 5);
 
-    if (found) {
-      setResult(found);
+    if (candidates.length === 1) {
+      setResult(candidates[0]);
       setPhase('result');
+    } else if (candidates.length > 1) {
+      setCandidateResults(candidates);
+      setPhase('candidates');
     } else {
+      // Fallback di sicurezza: prova anche la ricerca classica singola.
+      const found = await searchCardByName(query);
+      if (found) {
+        setResult(found);
+        setPhase('result');
+        return;
+      }
       Alert.alert(
         'Non trovata',
         `Nessuna carta "${name}" trovata.\nControlla il nome e riprova.`
       );
       setPhase('preview');
     }
-  }, [cardName]);
+  }, [cardName, manualCardCode, manualSetCode, manualRegMark]);
 
   // ── Reset ─────────────────────────────────────────────────────
 
   const reset = useCallback(() => {
     setCroppedUri(null);
     setCardName('');
+    setManualCardCode('');
+    setManualSetCode('');
+    setManualRegMark('');
     setStatusMsg('');
     setResult(null);
+    setCandidateResults([]);
     setPhase('idle');
   }, []);
 
@@ -292,7 +341,7 @@ export default function ScannerScreen() {
           >
             <Text style={s.title}>Riconoscimento fallito</Text>
             <Text style={s.subtitle}>
-              Scrivi il nome che vedi sulla carta per cercarla manualmente
+              Inserisci i dati principali della carta per una ricerca precisa (fallback)
             </Text>
 
             {croppedUri && (
@@ -313,12 +362,39 @@ export default function ScannerScreen() {
             <View style={s.searchBox}>
               <TextInput
                 style={s.searchInput}
-                placeholder="Nome carta (es. Pikachu, Charizard...)"
+                placeholder="Nome carta (es. Mew ex)"
                 placeholderTextColor="#666"
                 value={cardName}
                 onChangeText={setCardName}
                 autoCapitalize="words"
                 autoFocus
+                returnKeyType="next"
+              />
+              <TextInput
+                style={s.searchInput}
+                placeholder="Numero carta (es. 205/165)"
+                placeholderTextColor="#666"
+                value={manualCardCode}
+                onChangeText={setManualCardCode}
+                autoCapitalize="none"
+                returnKeyType="next"
+              />
+              <TextInput
+                style={s.searchInput}
+                placeholder="Set code (es. MEW)"
+                placeholderTextColor="#666"
+                value={manualSetCode}
+                onChangeText={setManualSetCode}
+                autoCapitalize="characters"
+                returnKeyType="next"
+              />
+              <TextInput
+                style={s.searchInput}
+                placeholder="Reg. Mark opzionale (es. G)"
+                placeholderTextColor="#666"
+                value={manualRegMark}
+                onChangeText={setManualRegMark}
+                autoCapitalize="characters"
                 returnKeyType="search"
                 onSubmitEditing={handleSearch}
               />
@@ -349,6 +425,55 @@ export default function ScannerScreen() {
             Cerco &ldquo;{cardName}&rdquo;...
           </Text>
         </View>
+      </SafeAreaView>
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  SCELTA CANDIDATO (quando ci sono più match coerenti)
+  // ═══════════════════════════════════════════════════════════════
+  if (phase === 'candidates') {
+    return (
+      <SafeAreaView style={s.darkBg}>
+        <ScrollView contentContainerStyle={s.scroll}>
+          <Text style={s.title}>Scegli la carta giusta</Text>
+          <Text style={s.subtitle}>
+            Ho trovato piu&apos; risultati coerenti. Tocca quello corretto.
+          </Text>
+          <View style={s.searchBox}>
+            {candidateResults.map((c) => (
+              <TouchableOpacity
+                key={c.id}
+                style={s.candidateCard}
+                onPress={() => {
+                  setResult(c);
+                  setPhase('result');
+                }}
+              >
+                {c.imageUrl ? (
+                  <Image
+                    source={{ uri: c.imageUrl }}
+                    style={s.candidateImg}
+                    contentFit="cover"
+                  />
+                ) : (
+                  <View style={[s.candidateImg, s.thumbPlaceholder]}>
+                    <Text style={s.thumbEmoji}>🃏</Text>
+                  </View>
+                )}
+                <View style={s.candidateInfo}>
+                  <Text style={s.cardName} numberOfLines={1}>{c.name}</Text>
+                  <Text style={s.cardSub} numberOfLines={1}>{c.set}</Text>
+                  <Text style={s.cardSub}>{c.number}</Text>
+                  {c.rarity ? <Text style={s.cardDate}>{c.rarity}</Text> : null}
+                </View>
+              </TouchableOpacity>
+            ))}
+          </View>
+          <TouchableOpacity style={s.retryBtn} onPress={() => setPhase('preview')}>
+            <Text style={s.retryTxt}>Torna alla ricerca manuale</Text>
+          </TouchableOpacity>
+        </ScrollView>
       </SafeAreaView>
     );
   }
@@ -530,6 +655,37 @@ const s = StyleSheet.create({
     borderRadius: 14, justifyContent: 'center', alignItems: 'center',
   },
   searchBtnTxt: { color: '#FFF', fontSize: 16, fontWeight: '700' },
+  thumbPlaceholder: {
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  thumbEmoji: { fontSize: 24 },
+
+  // Candidate picker
+  candidateCard: {
+    width: '100%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 12,
+    borderRadius: 12,
+    marginBottom: 10,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+  },
+  candidateImg: {
+    width: 64,
+    height: 88,
+    borderRadius: 8,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+  },
+  candidateInfo: {
+    flex: 1,
+    marginLeft: 12,
+  },
+  cardName: { color: '#FFF', fontSize: 16, fontWeight: '700' },
+  cardSub: { color: '#AAA', fontSize: 13, marginTop: 2 },
+  cardDate: { color: '#666', fontSize: 11, marginTop: 4 },
 
   retryBtn: { marginTop: 16, paddingVertical: 10 },
   retryTxt: { color: '#888', fontSize: 14, fontWeight: '500' },
